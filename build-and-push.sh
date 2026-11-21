@@ -1,109 +1,87 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Exit immediately if a command fails
-set -e
+usage() {
+  cat <<'EOF'
+Usage: bash build-and-push.sh VERSION
 
-# Function to get the next semantic version
-get_next_version() {
-    local latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "0")
-
-    if [[ "$latest_tag" == "0" ]]; then
-        echo "1.0.0"
-        return
-    fi
-
-    # Remove optional leading 'v'
-    local tag_body=${latest_tag#v}
-
-    if [[ "$tag_body" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-        local major="${BASH_REMATCH[1]}"
-        local minor="${BASH_REMATCH[2]}"
-        local patch="${BASH_REMATCH[3]}"
-        # Increment patch version
-        echo "$major.$minor.$((patch + 1))"
-    else
-        # Fallback if format doesn't match strict semver X.Y.Z
-        echo "⚠️ Warning: Latest tag '$latest_tag' is not in strict X.Y.Z format. Defaulting to 1.0.0." >&2 # Send warning to stderr
-        echo "1.0.0"
-    fi
+Build and test the current clean commit, then ask before publishing a release.
+VERSION must be an explicit X.Y.Z or vX.Y.Z (or set NEW_TAG).
+Required: GITHUB_USER_OR_ORG, GITHUB_USER, GITHUB_PAT.
+Requires Git, Docker, ShellCheck, jq, and the runtime test dependencies.
+EOF
 }
 
-# Generate a new version tag
-GHCR_HOSTNAME="ghcr.io"
-NEW_TAG=$(get_next_version)
-IMAGE_NAME="wg-easy-sentinel"
-
-# --- Validate Environment Variables ---
-if [[ -z "${NEW_TAG:-}" ]]; then
-    echo "❌ Error: NEW_TAG environment variable is not set."
-    exit 1
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+  usage
+  exit 0
 fi
-if [[ -z "${IMAGE_NAME:-}" ]]; then
-    echo "❌ Error: IMAGE_NAME environment variable is not set."
-    exit 1
-fi
-if [[ -z "${GITHUB_USER_OR_ORG:-}" ]]; then
-    echo "❌ Error: GITHUB_USER_OR_ORG environment variable is not set."
-    exit 1
-fi
-if [[ -z "${GITHUB_USER:-}" ]]; then
-    echo "❌ Error: GITHUB_USER environment variable is not set (usually your GitHub username)."
-    exit 1
-fi
-if [[ -z "${GITHUB_PAT:-}" ]]; then
-    echo "❌ Error: GITHUB_PAT environment variable is not set (Personal Access Token with package scopes)."
-    exit 1
+if (( $# > 1 )); then
+  usage >&2
+  exit 1
 fi
 
-# Confirm before proceeding
-echo "🚀 New version to be tagged: $IMAGE_NAME:$NEW_TAG"
-read -p "Do you want to proceed? (y/N): " CONFIRM
-if [[ "$CONFIRM" != "y" ]]; then
-    echo "❌ Aborting."
-    exit 1
+release_tag=${1:-${NEW_TAG:-}}
+if [[ ! $release_tag =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  printf 'An explicit semantic version is required.\n' >&2
+  usage >&2
+  exit 1
 fi
+: "${GITHUB_USER_OR_ORG:?Set GITHUB_USER_OR_ORG to your registry namespace}"
+: "${GITHUB_USER:?Set GITHUB_USER to your registry login}"
+: "${GITHUB_PAT:?Set GITHUB_PAT to your registry access token}"
 
-# Define the full image paths for GHCR
-GHCR_IMAGE_BASE="${GHCR_HOSTNAME}/${GITHUB_USER_OR_ORG}/${IMAGE_NAME}"
-GHCR_IMAGE_TAGGED="${GHCR_IMAGE_BASE}:${NEW_TAG}"
-GHCR_IMAGE_LATEST="${GHCR_IMAGE_BASE}:latest"
-
-# --- Git Tagging ---
-echo "🏷️ Creating and pushing Git tag: $NEW_TAG"
-# Check if tag exists locally first
-if git rev-parse "$NEW_TAG" >/dev/null 2>&1; then
-    echo "⚠️ Warning: Git tag '$NEW_TAG' already exists locally. Skipping tag creation."
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+for tool in git docker shellcheck jq; do
+  command -v "$tool" >/dev/null || { printf 'Missing required tool: %s\n' "$tool" >&2; exit 1; }
+done
+if [[ -n $(git status --porcelain) ]]; then
+  printf 'Commit or stash all working tree changes before releasing.\n' >&2
+  exit 1
+fi
+if git show-ref --verify --quiet "refs/tags/$release_tag"; then
+  printf 'Local tag already exists: %s\n' "$release_tag" >&2
+  exit 1
+fi
+if git ls-remote --exit-code --tags origin "refs/tags/$release_tag" >/dev/null; then
+  printf 'Remote tag already exists: %s\n' "$release_tag" >&2
+  exit 1
 else
-    git tag -a "$NEW_TAG" -m "Release $NEW_TAG" || { echo "❌ Failed to create Git tag."; exit 1; }
+  remote_status=$?
+  if (( remote_status != 2 )); then
+    printf 'Could not check remote tags; refusing to publish.\n' >&2
+    exit 1
+  fi
 fi
-git push origin "$NEW_TAG" || { echo "❌ Failed to push Git tag '$NEW_TAG'. It might already exist remotely or another issue occurred."; exit 1; }
 
-# --- Docker Build and Tag for GHCR ---
-echo "🐳 Building Docker image for GHCR..."
-# Build using the versioned tag directly
-docker build -t "$GHCR_IMAGE_TAGGED" . || { echo "❌ Failed to build Docker image."; exit 1; }
+revision=$(git rev-parse HEAD)
+image_base="ghcr.io/${GITHUB_USER_OR_ORG,,}/wg-easy-sentinel"
+image_version="$image_base:${release_tag#v}"
+build_context=$(mktemp -d)
+trap 'rm -rf -- "$build_context"' EXIT
+# Archive the exact commit so ignored files and local credentials cannot enter a build.
+git archive "$revision" | tar -x -C "$build_context"
+(
+  cd -- "$build_context"
+  shellcheck wg-easy-sentinel.sh entrypoint.sh build-and-push.sh tests/run.sh
+  bash tests/run.sh
+)
+docker build --pull --label "org.opencontainers.image.revision=$revision" \
+  --tag "$image_version" "$build_context"
+docker run --rm "$image_version" /app/wg-easy-sentinel.sh --help
 
-echo "🏷️ Tagging image as 'latest' for GHCR..."
-docker tag "$GHCR_IMAGE_TAGGED" "$GHCR_IMAGE_LATEST" || { echo "❌ Failed to tag image as latest."; exit 1; }
+printf 'Verified commit: %s\nImages: %s and %s:latest\nGit tag: %s\n' \
+  "$revision" "$image_version" "$image_base" "$release_tag"
+read -r -p 'Publish these images and push the Git tag? [y/N] ' confirm
+if [[ $confirm != y && $confirm != Y ]]; then
+  printf 'Build verified; publication cancelled.\n'
+  exit 0
+fi
 
-# --- Log in to GitHub Container Registry ---
-echo "🔑 Logging in to ${GHCR_HOSTNAME} as user '${GITHUB_USER}'..."
-# Use password-stdin for security
-echo "$GITHUB_PAT" | docker login "$GHCR_HOSTNAME" -u "$GITHUB_USER" --password-stdin || { echo "❌ Failed to log in to GHCR. Check username and PAT scopes."; exit 1; }
-echo "🔐 Login successful."
-
-# --- Push the images to GHCR ---
-echo "📤 Pushing Docker images to ${GHCR_HOSTNAME}..."
-
-echo "   Pushing ${GHCR_IMAGE_TAGGED}..."
-docker push "$GHCR_IMAGE_TAGGED" || { echo "❌ Failed to push tagged image."; exit 1; }
-
-echo "   Pushing ${GHCR_IMAGE_LATEST}..."
-docker push "$GHCR_IMAGE_LATEST" || { echo "❌ Failed to push latest image."; exit 1; }
-
-echo "✅ Docker images pushed successfully to GHCR!"
-echo "📌 Image tags available at ${GHCR_HOSTNAME}/${GITHUB_USER_OR_ORG}/${IMAGE_NAME}:"
-echo "   - ${NEW_TAG}"
-echo "   - latest"
-
-exit 0
+printf '%s' "$GITHUB_PAT" | docker login ghcr.io --username "$GITHUB_USER" --password-stdin
+docker push "$image_version"
+docker tag "$image_version" "$image_base:latest"
+docker push "$image_base:latest"
+git tag -a "$release_tag" "$revision" -m "Release $release_tag"
+git push origin "refs/tags/$release_tag"
+printf 'Published %s from %s.\n' "$image_version" "$revision"

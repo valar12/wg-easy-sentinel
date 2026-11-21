@@ -1,17 +1,44 @@
 services:
   wg-easy-sentinel:
-    image: ghcr.io/xegabriel/wg-easy-sentinel:latest
+    image: wg-easy-sentinel:local
     build: .
+    pull_policy: build
     container_name: wg-easy-sentinel
     environment:
-      - WG_CONTAINER_NAME=wg-easy
-      - VPN_NAME=wg-vpn
-      - TIMEOUT_THRESHOLD=120
-      - PUSHOVER_APP_TOKEN=${PUSHOVER_APP_TOKEN}
-      - PUSHOVER_USER_KEY=${PUSHOVER_USER_KEY}
+      WG_CONTAINER_NAME: ${WG_CONTAINER_NAME:-wg-easy}
+      WG_INTERFACE: ${WG_INTERFACE:-wg0}
+      VPN_NAME: ${VPN_NAME:-wg-vpn}
+      POLL_INTERVAL: ${POLL_INTERVAL:-60}
+      TIMEOUT_THRESHOLD: ${TIMEOUT_THRESHOLD:-180}
+      PUSHOVER_APP_TOKEN: ${PUSHOVER_APP_TOKEN:-}
+      PUSHOVER_USER_KEY: ${PUSHOVER_USER_KEY:-}
+      PUSHOVER_APP_TOKEN_FILE: ${PUSHOVER_APP_TOKEN_FILE:-}
+      PUSHOVER_USER_KEY_FILE: ${PUSHOVER_USER_KEY_FILE:-}
+      DRY_RUN: ${DRY_RUN:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DOCKER_TIMEOUT: ${DOCKER_TIMEOUT:-10}
+      HTTP_CONNECT_TIMEOUT: ${HTTP_CONNECT_TIMEOUT:-5}
+      HTTP_TIMEOUT: ${HTTP_TIMEOUT:-15}
+      NOTIFICATION_BATCH_SIZE: ${NOTIFICATION_BATCH_SIZE:-5}
+      STATE_FILE: ${STATE_FILE:-/app/data/.wg_easy_sentinel_state}
+      LOCK_FILE: ${LOCK_FILE:-/tmp/wg_monitor.lock}
+      TZ: ${TZ:-UTC}
     volumes:
-      # Persist state between container runs. Create a "/srv/Appdata/wg-easy-sentinel" folder.
-      - /srv/Appdata/wg-easy-sentinel:/app/data
-      # Allow the container to access the Docker socket.
+      - ${SENTINEL_DATA_DIR:-/srv/Appdata/wg-easy-sentinel}:/app/data
+      # Docker API access is required to execute wg in the VPN container.
       - /var/run/docker.sock:/var/run/docker.sock
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    stop_grace_period: 30s
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

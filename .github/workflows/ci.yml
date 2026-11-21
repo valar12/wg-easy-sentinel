@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install test tools
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck jq
+      - name: Check shell scripts
+        run: |
+          for script in wg-easy-sentinel.sh entrypoint.sh build-and-push.sh tests/run.sh; do
+            bash -n "$script"
+          done
+          shellcheck wg-easy-sentinel.sh entrypoint.sh build-and-push.sh tests/run.sh
+      - name: Run regression tests
+        run: bash tests/run.sh
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+      - name: Build runtime image
+        run: docker build --pull --tag wg-easy-sentinel:test .
+      - name: Check runtime dependencies and CLI
+        run: |
+          docker run --rm --entrypoint sh wg-easy-sentinel:test -ec '
+            for tool in bash docker curl jq flock timeout; do command -v "$tool"; done
+          '
+          docker run --rm wg-easy-sentinel:test /app/wg-easy-sentinel.sh --help
+          if docker run --rm wg-easy-sentinel:test /app/wg-easy-sentinel.sh --healthcheck; then
+            echo 'A fresh container with no successful observation must be unhealthy.' >&2
+            exit 1
+          fi
+      - name: Run regression tests on Alpine
+        run: |
+          docker run --rm --volume "$PWD:/src:ro" --entrypoint bash \
+            wg-easy-sentinel:test /src/tests/run.sh
+
+  publish:
+    needs: test
+    if: >-
+      ${{ github.repository == 'valar12/wg-easy-sentinel' &&
+          (github.event_name == 'workflow_dispatch' ||
+           (github.event_name == 'push' &&
+            (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/modernize-existing'))) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: ghcr-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/valar12/wg-easy-sentinel:latest
+            ghcr.io/valar12/wg-easy-sentinel:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.title=wg-easy-sentinel
+            org.opencontainers.image.source=https://github.com/valar12/wg-easy-sentinel
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT

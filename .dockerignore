@@ -1,0 +1,13 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+data/
+secrets/
+work/
+tests/
+README.md
+build-and-push.sh
